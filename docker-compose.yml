@@ -1,6 +1,25 @@
-version: '3.8'
+# Combined OpenClaw + Mission Control Docker Compose
+# This requires building Mission Control from source
 
 services:
+  # OpenClaw Browser
+  browser:
+    image: "coollabsio/openclaw-browser:latest"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - CHROME_CLI=--remote-debugging-port=9222
+    volumes:
+      - "browser-data:/config"
+    shm_size: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/9222' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # OpenClaw
   openclaw:
     image: "coollabsio/openclaw:latest"
     environment:
@@ -24,36 +43,18 @@ services:
       - OPENCODE_API_KEY=${OPENCODE_API_KEY}
       - SYNTHETIC_API_KEY=${SYNTHETIC_API_KEY}
       - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN}
-      - XIAOMI_API_KEY=${XIAOMI_API_KEY}
       - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL}
       - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
-      - BEDROCK_PROVIDER_FILTER=${BEDROCK_PROVIDER_FILTER:-anthropic}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - PORT=8080
       - OPENCLAW_GATEWAY_PORT=18789
-      - OPENCLAW_GATEWAY_BIND=${OPENCLAW_GATEWAY_BIND:-0.0.0.0}
+      - OPENCLAW_GATEWAY_BIND=0.0.0.0
       - OPENCLAW_STATE_DIR=/data/.openclaw
       - OPENCLAW_WORKSPACE_DIR=/data/workspace
       - BROWSER_CDP_URL=http://browser:9223
-      - BROWSER_DEFAULT_PROFILE=${BROWSER_DEFAULT_PROFILE:-openclaw}
-      - BROWSER_EVALUATE_ENABLED=${BROWSER_EVALUATE_ENABLED:-true}
-      - BROWSER_SNAPSHOT_MODE=${BROWSER_SNAPSHOT_MODE:-efficient}
-      - BROWSER_REMOTE_TIMEOUT_MS=${BROWSER_REMOTE_TIMEOUT_MS:-1500}
-      - BROWSER_REMOTE_HANDSHAKE_TIMEOUT_MS=${BROWSER_REMOTE_HANDSHAKE_TIMEOUT_MS:-3000}
-      - HOOKS_ENABLED=${HOOKS_ENABLED:-false}
-      - HOOKS_PATH=${HOOKS_PATH:-/hooks}
-      - MOONSHOT_BASE_URL=${MOONSHOT_BASE_URL:-https://api.moonshot.ai/v1}
-      - KIMI_BASE_URL=${KIMI_BASE_URL:-https://api.moonshot.ai/anthropic}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
-      - WHATSAPP_ENABLED=${WHATSAPP_ENABLED}
-      - OPENCLAW_DOCKER_APT_PACKAGES=${OPENCLAW_DOCKER_APT_PACKAGES}
     volumes:
       - "openclaw-data:/data"
     depends_on:
@@ -65,68 +66,100 @@ services:
       timeout: 10s
       retries: 5
 
-  browser:
-    image: "coollabsio/openclaw-browser:latest"
+  # Mission Control Database
+  db:
+    image: postgres:16-alpine
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Etc/UTC
-      - CHROME_CLI=--remote-debugging-port=9222
+      POSTGRES_DB: ${POSTGRES_DB:-mission_control}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
-      - "browser-data:/config"
-    shm_size: 2g
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/9222' || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      timeout: 3s
+      retries: 20
 
-  # Mission Control Backend
-  mission-control-backend:
-    image: ghcr.io/abhi1693/openclaw-mission-control-backend:latest
-    environment:
-      - AUTH_MODE=local
-      - LOCAL_AUTH_TOKEN=${MISSION_CONTROL_TOKEN:?Please set MISSION_CONTROL_TOKEN (≥50 chars)}
-      - DB_AUTO_MIGRATE=true
-      - CORS_ORIGINS=http://mission-control-frontend:3000
-      - NEXT_PUBLIC_API_URL=http://mission-control-backend:8000
-    ports:
-      - "8000:8000"
-    volumes:
-      - mission-control-data:/data
+  # Mission Control Redis
+  redis:
+    image: redis:7-alpine
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/healthz"]
-      interval: 10s
-      timeout: 10s
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 5
 
-  # Mission Control Frontend
-  mission-control-frontend:
-    image: ghcr.io/abhi1693/openclaw-mission-control-frontend:latest
+  # Mission Control Backend (build from source)
+  mission-control-backend:
+    build:
+      context: ./mission-control
+      dockerfile: backend/Dockerfile
+    env_file:
+      - ./mission-control/backend/.env
     environment:
-      - NEXT_PUBLIC_AUTH_MODE=local
-      - NEXT_PUBLIC_API_URL=http://mission-control-backend:8000
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-mission_control}
+      CORS_ORIGINS: http://mission-control-frontend:3000
+      DB_AUTO_MIGRATE: "true"
+      AUTH_MODE: local
+      LOCAL_AUTH_TOKEN: ${MISSION_CONTROL_TOKEN}
+      RQ_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
-      - "3000:3000"
+      - "8000:8000"
+
+  # Mission Control Frontend (build from source)
+  mission-control-frontend:
+    build:
+      context: ./mission-control/frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://mission-control-backend:8000
+        NEXT_PUBLIC_AUTH_MODE: local
+    environment:
+      NEXT_PUBLIC_API_URL: http://mission-control-backend:8000
+      NEXT_PUBLIC_AUTH_MODE: local
     depends_on:
       - mission-control-backend
+    ports:
+      - "3000:3000"
 
-  # File Explorer (filebrowser)
+  # Mission Control Worker
+  webhook-worker:
+    build:
+      context: ./mission-control
+      dockerfile: backend/Dockerfile
+    command: ["python", "scripts/rq-docker", "worker"]
+    env_file:
+      - ./mission-control/backend/.env
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-mission_control}
+      AUTH_MODE: local
+      LOCAL_AUTH_TOKEN: ${MISSION_CONTROL_TOKEN}
+      RQ_REDIS_URL: redis://redis:6379/0
+      RQ_QUEUE_NAME: default
+    restart: unless-stopped
+
+  # File Explorer
   filebrowser:
     image: filebrowser/filebrowser:latest
-    container_name: filebrowser
     volumes:
-      - ./:/srv
+      - ./workspace:/srv
       - filebrowser-config:/config
     ports:
       - "8081:80"
-    environment:
-      - PUID=1000
-      - PGID=1000
     restart: unless-stopped
 
 volumes:
   openclaw-data:
   browser-data:
-  mission-control-data:
+  postgres_data:
   filebrowser-config:
