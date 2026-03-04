@@ -1,5 +1,4 @@
 # Combined OpenClaw + Mission Control Docker Compose
-# This requires building Mission Control from source
 
 services:
   # OpenClaw Browser
@@ -75,6 +74,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -84,25 +85,27 @@ services:
   # Mission Control Redis
   redis:
     image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  # Mission Control Backend (build from source)
-  mission-control-backend:
+  # Mission Control Backend
+  backend:
     build:
-      context: ./mission-control
+      context: .
       dockerfile: backend/Dockerfile
     env_file:
-      - ./mission-control/backend/.env
+      - ./backend/.env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-mission_control}
-      CORS_ORIGINS: http://mission-control-frontend:3000
-      DB_AUTO_MIGRATE: "true"
-      AUTH_MODE: local
-      LOCAL_AUTH_TOKEN: ${MISSION_CONTROL_TOKEN}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      DB_AUTO_MIGRATE: ${DB_AUTO_MIGRATE:-true}
+      AUTH_MODE: ${AUTH_MODE}
+      LOCAL_AUTH_TOKEN: ${LOCAL_AUTH_TOKEN}
       RQ_REDIS_URL: redis://redis:6379/0
     depends_on:
       db:
@@ -110,31 +113,34 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
 
-  # Mission Control Frontend (build from source)
-  mission-control-frontend:
+  # Mission Control Frontend
+  frontend:
     build:
-      context: ./mission-control/frontend
+      context: ./frontend
       args:
-        NEXT_PUBLIC_API_URL: http://mission-control-backend:8000
-        NEXT_PUBLIC_AUTH_MODE: local
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-auto}
+        NEXT_PUBLIC_AUTH_MODE: ${AUTH_MODE}
+    env_file:
+      - path: ./frontend/.env
+        required: false
     environment:
-      NEXT_PUBLIC_API_URL: http://mission-control-backend:8000
-      NEXT_PUBLIC_AUTH_MODE: local
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-auto}
+      NEXT_PUBLIC_AUTH_MODE: ${AUTH_MODE}
     depends_on:
-      - mission-control-backend
+      - backend
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
 
   # Mission Control Worker
   webhook-worker:
     build:
-      context: ./mission-control
+      context: .
       dockerfile: backend/Dockerfile
     command: ["python", "scripts/rq-docker", "worker"]
     env_file:
-      - ./mission-control/backend/.env
+      - ./backend/.env
     depends_on:
       redis:
         condition: service_healthy
@@ -142,10 +148,12 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-mission_control}
-      AUTH_MODE: local
-      LOCAL_AUTH_TOKEN: ${MISSION_CONTROL_TOKEN}
+      AUTH_MODE: ${AUTH_MODE}
+      LOCAL_AUTH_TOKEN: ${LOCAL_AUTH_TOKEN}
       RQ_REDIS_URL: redis://redis:6379/0
-      RQ_QUEUE_NAME: default
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-default}
+      RQ_DISPATCH_THROTTLE_SECONDS: ${RQ_DISPATCH_THROTTLE_SECONDS:-2.0}
+      RQ_DISPATCH_MAX_RETRIES: ${RQ_DISPATCH_MAX_RETRIES:-3}
     restart: unless-stopped
 
   # File Explorer
